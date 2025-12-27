@@ -1,41 +1,34 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-import hashlib
 import plotly.express as px
+import hashlib
 from datetime import datetime
 
-# ---------------- CONFIG ----------------
+# ------------------ CONFIG ------------------
 st.set_page_config(page_title="Saloon Dashboard", layout="wide")
 
-DB = "saloon.db"
-
-# ---------------- DATABASE ----------------
-def get_conn():
-    return sqlite3.connect(DB, check_same_thread=False)
+# ------------------ DATABASE ------------------
+conn = sqlite3.connect("saloon.db", check_same_thread=False)
+c = conn.cursor()
 
 def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-
     c.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
         password TEXT,
         role TEXT
-    )
-    """)
+    )""")
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
-        stock INTEGER,
         buy_price REAL,
-        sell_price REAL
-    )
-    """)
+        sell_price REAL,
+        stock INTEGER
+    )""")
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS sales (
@@ -43,169 +36,216 @@ def init_db():
         product_id INTEGER,
         quantity INTEGER,
         sale_time TEXT
-    )
-    """)
+    )""")
 
-    # Default Admin
-    c.execute("SELECT * FROM users")
-    if not c.fetchall():
-        c.execute(
-            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-            ("admin", hash_pw("admin"), "admin")
-        )
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS shifts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user TEXT,
+        start_time TEXT,
+        end_time TEXT,
+        cash_start REAL,
+        cash_end REAL
+    )""")
 
     conn.commit()
-    conn.close()
+
+    # Admin erstellen falls nicht existiert
+    c.execute("SELECT * FROM users WHERE username='admin'")
+    if not c.fetchone():
+        c.execute(
+            "INSERT INTO users VALUES (NULL, ?, ?, ?)",
+            ("admin", hash_pw("admin"), "admin")
+        )
+        conn.commit()
 
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-# ---------------- LOGIN ----------------
+init_db()
+
+# ------------------ LOGIN ------------------
 def login():
     st.title("🔐 Login")
 
-    user = st.text_input("Benutzername")
-    pw = st.text_input("Passwort", type="password")
+    user = st.text_input("Username")
+    pw = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        conn = get_conn()
-        c = conn.cursor()
         c.execute(
             "SELECT username, role FROM users WHERE username=? AND password=?",
             (user, hash_pw(pw))
         )
-        result = c.fetchone()
-        conn.close()
-
-        if result:
-            st.session_state.user = result[0]
-            st.session_state.role = result[1]
+        res = c.fetchone()
+        if res:
+            st.session_state.user = res[0]
+            st.session_state.role = res[1]
             st.rerun()
         else:
             st.error("Falsche Login-Daten")
 
-# ---------------- PRODUCTS ----------------
-def products_page():
-    st.header("📦 Produkte & Lager")
+if "user" not in st.session_state:
+    login()
+    st.stop()
 
-    conn = get_conn()
+# ------------------ UI STYLE ------------------
+st.markdown("""
+<style>
+.card {
+    background: #1e1e1e;
+    padding: 20px;
+    border-radius: 15px;
+    margin-bottom: 15px;
+}
+h1,h2,h3 { color: white; }
+</style>
+""", unsafe_allow_html=True)
 
-    df = pd.read_sql("SELECT * FROM products", conn)
+# ------------------ SIDEBAR ------------------
+st.sidebar.title("📊 Menü")
+tab = st.sidebar.radio(
+    "Navigation",
+    ["Dashboard", "Produkte", "Verkäufe", "Analyse", "Schichten", "Benutzer"]
+)
 
-    st.subheader("➕ Produkt hinzufügen")
+# ------------------ DASHBOARD ------------------
+if tab == "Dashboard":
+    st.title("📈 Übersicht")
+
+    df = pd.read_sql("SELECT * FROM sales", conn)
+    total_sales = len(df)
+
+    st.markdown(f"""
+    <div class='card'>
+        <h2>Gesamtverkäufe</h2>
+        <h1>{total_sales}</h1>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ------------------ PRODUKTE ------------------
+if tab == "Produkte":
+    st.title("📦 Produkte & Lager")
+
     with st.form("add_product"):
         name = st.text_input("Name")
-        stock = st.number_input("Lagerbestand", 0, 10000)
         buy = st.number_input("Einkaufspreis", 0.0)
         sell = st.number_input("Verkaufspreis", 0.0)
-        if st.form_submit_button("Speichern"):
-            conn.execute(
-                "INSERT INTO products (name, stock, buy_price, sell_price) VALUES (?, ?, ?, ?)",
-                (name, stock, buy, sell)
+        stock = st.number_input("Lagerbestand", 0, step=1)
+        if st.form_submit_button("Hinzufügen"):
+            c.execute(
+                "INSERT INTO products VALUES (NULL, ?, ?, ?, ?)",
+                (name, buy, sell, stock)
             )
             conn.commit()
             st.rerun()
 
-    st.subheader("📋 Übersicht")
-    st.dataframe(df, use_container_width=True)
+    df = pd.read_sql("SELECT * FROM products", conn)
+    st.dataframe(df)
 
-# ---------------- SALES ----------------
-def sales_page():
-    st.header("💰 Verkauf")
+    if not df.empty:
+        pid = st.selectbox("Produkt auswählen", df["id"])
+        new_stock = st.number_input("Lager anpassen", step=1)
+        if st.button("Lager aktualisieren"):
+            c.execute("UPDATE products SET stock=? WHERE id=?", (new_stock, pid))
+            conn.commit()
+            st.rerun()
 
-    conn = get_conn()
-    products = pd.read_sql("SELECT * FROM products", conn)
+        if st.button("Produkt löschen"):
+            c.execute("DELETE FROM products WHERE id=?", (pid,))
+            conn.commit()
+            st.rerun()
 
-    if products.empty:
-        st.warning("Keine Produkte vorhanden")
-        return
+# ------------------ VERKÄUFE ------------------
+if tab == "Verkäufe":
+    st.title("🧾 Verkauf")
 
-    product = st.selectbox("Produkt", products["name"])
-    qty = st.number_input("Menge", 1, 100)
+    df = pd.read_sql("SELECT * FROM products", conn)
+    if df.empty:
+        st.info("Keine Produkte")
+    else:
+        pid = st.selectbox("Produkt", df["id"])
+        qty = st.number_input("Menge", 1, step=1)
 
-    if st.button("Verkaufen"):
-        p = products[products["name"] == product].iloc[0]
-        conn.execute(
-            "INSERT INTO sales (product_id, quantity, sale_time) VALUES (?, ?, ?)",
-            (p["id"], qty, datetime.now().isoformat())
-        )
-        conn.execute(
-            "UPDATE products SET stock = stock - ? WHERE id = ?",
-            (qty, p["id"])
-        )
-        conn.commit()
-        st.success("Verkauf gespeichert")
+        if st.button("Verkaufen"):
+            c.execute(
+                "INSERT INTO sales VALUES (NULL, ?, ?, ?)",
+                (pid, qty, datetime.now().isoformat())
+            )
+            c.execute("UPDATE products SET stock = stock - ? WHERE id=?", (qty, pid))
+            conn.commit()
+            st.success("Verkauf gespeichert")
+            st.rerun()
 
-# ---------------- ANALYTICS ----------------
-def analytics_page():
-    st.header("📊 Analyse")
-
-    conn = get_conn()
+# ------------------ ANALYSE ------------------
+if tab == "Analyse":
+    st.title("📊 Analyse")
 
     df = pd.read_sql("""
-        SELECT
-            s.sale_time,
-            p.name,
-            s.quantity,
-            p.sell_price,
-            p.buy_price,
-            s.quantity * p.sell_price AS revenue,
-            s.quantity * (p.sell_price - p.buy_price) AS profit
-        FROM sales s
-        JOIN products p ON s.product_id = p.id
+    SELECT s.sale_time,
+           p.name,
+           s.quantity,
+           p.sell_price,
+           p.buy_price,
+           (s.quantity * p.sell_price) AS revenue,
+           (s.quantity * (p.sell_price - p.buy_price)) AS profit
+    FROM sales s
+    JOIN products p ON s.product_id = p.id
     """, conn)
 
-    if df.empty:
-        st.info("Noch keine Verkäufe")
-        return
+    if not df.empty:
+        fig = px.bar(df, x="sale_time", y="revenue", title="Umsatz")
+        st.plotly_chart(fig, use_container_width=True)
+        st.metric("Gesamtgewinn", f"{df['profit'].sum():.2f} €")
+    else:
+        st.info("Keine Daten")
 
-    fig1 = px.line(df, x="sale_time", y="revenue", title="Umsatz")
-    fig2 = px.line(df, x="sale_time", y="profit", title="Gewinn")
+# ------------------ SCHICHTEN ------------------
+if tab == "Schichten":
+    st.title("⏱ Schichten")
 
-    c1, c2 = st.columns(2)
-    c1.plotly_chart(fig1, use_container_width=True)
-    c2.plotly_chart(fig2, use_container_width=True)
+    with st.form("shift"):
+        cash_start = st.number_input("Kassenstand Anfang", 0.0)
+        if st.form_submit_button("Schicht starten"):
+            c.execute(
+                "INSERT INTO shifts VALUES (NULL, ?, ?, NULL, ?, NULL)",
+                (st.session_state.user, datetime.now().isoformat(), cash_start)
+            )
+            conn.commit()
+            st.rerun()
 
-# ---------------- USERS (ADMIN) ----------------
-def users_page():
-    st.header("👥 Benutzer (Admin)")
+    with st.form("end_shift"):
+        cash_end = st.number_input("Kassenstand Ende", 0.0)
+        if st.form_submit_button("Schicht beenden"):
+            c.execute("""
+            UPDATE shifts SET end_time=?, cash_end=?
+            WHERE user=? AND end_time IS NULL
+            """, (datetime.now().isoformat(), cash_end, st.session_state.user))
+            conn.commit()
+            st.rerun()
 
-    conn = get_conn()
-    users = pd.read_sql("SELECT id, username, role FROM users", conn)
-    st.dataframe(users, use_container_width=True)
+    st.dataframe(pd.read_sql("SELECT * FROM shifts", conn))
 
-    with st.form("add_user"):
+# ------------------ BENUTZER ------------------
+if tab == "Benutzer" and st.session_state.role == "admin":
+    st.title("👥 Benutzer")
+
+    with st.form("user"):
         u = st.text_input("Username")
         p = st.text_input("Passwort")
         r = st.selectbox("Rolle", ["admin", "staff"])
         if st.form_submit_button("Erstellen"):
-            conn.execute(
-                "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+            c.execute(
+                "INSERT INTO users VALUES (NULL, ?, ?, ?)",
                 (u, hash_pw(p), r)
             )
             conn.commit()
             st.rerun()
 
-# ---------------- MAIN ----------------
-init_db()
+    df = pd.read_sql("SELECT id, username, role FROM users", conn)
+    st.dataframe(df)
 
-if "user" not in st.session_state:
-    login()
-else:
-    st.sidebar.success(f"👤 {st.session_state.user} ({st.session_state.role})")
-
-    page = st.sidebar.radio(
-        "Navigation",
-        ["Produkte", "Verkauf", "Analyse", "Benutzer"]
-        if st.session_state.role == "admin"
-        else ["Produkte", "Verkauf", "Analyse"]
-    )
-
-    if page == "Produkte":
-        products_page()
-    elif page == "Verkauf":
-        sales_page()
-    elif page == "Analyse":
-        analytics_page()
-    elif page == "Benutzer":
-        users_page()
+    uid = st.selectbox("User löschen", df["id"])
+    if st.button("Löschen"):
+        c.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.commit()
+        st.rerun()
